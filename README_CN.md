@@ -2,7 +2,7 @@
 
 # Multi-Video-Summarizer
 
-一个 AI Agent Skill（AI 代理技能），可从多个视频平台提取字幕/转录文本，并生成带有关键帧截图的结构化总结笔记。适用于 **Cursor IDE** 和 **Claude Code**。
+一个 AI Agent Skill（AI 代理技能），可从多个视频平台提取字幕、完整口播转录，并生成带有关键帧截图的结构化总结笔记。
 
 ## 支持的平台
 
@@ -10,7 +10,7 @@
 |---|---|---|---|
 | **B站**（Bilibili） | `bilibili.com/video/BVxxx` | 公开 API（WBI 签名） | 无（仅用 Python 标准库） |
 | **YouTube** | `youtube.com/watch?v=xxx`、`youtu.be/xxx` | `youtube-transcript-api` | `pip install youtube-transcript-api` |
-| **抖音**（Douyin） | `douyin.com/`、`v.douyin.com/xxx` | 直接 API 解析（无需 Cookie） | 无需额外依赖；Whisper 用于转录 |
+| **抖音**（Douyin） | `douyin.com/`、`v.douyin.com/xxx` | 页面字幕/API → yt-dlp → 可播放页面的浏览器音频回退 | `yt-dlp`、本地 Whisper；浏览器回退需 ffmpeg |
 | **小红书**（Xiaohongshu） | `xiaohongshu.com/`、`xhslink.com/` | 直接页面解析（无需 Cookie） | 无需额外依赖；Whisper 用于转录 |
 | **TikTok** | `tiktok.com/@user/video/xxx` | yt-dlp | `pip install yt-dlp` |
 | **1800+ 其他网站** | 任何 yt-dlp 支持的 URL | yt-dlp | `pip install yt-dlp` |
@@ -18,8 +18,8 @@
 ## 功能特性
 
 - **多平台字幕提取**：自动检测视频平台
-- **三层降级策略**：平台 API → yt-dlp 字幕 → Whisper 语音识别
-- **主流平台免 Cookie**：B站、抖音、小红书均无需登录或 Cookie 即可使用
+- **多路径转录**：平台字幕/API → yt-dlp 字幕或音频 → Whisper 语音识别
+- **抖音浏览器音频回退**：当详情接口返回 403、但视频页仍可播放时，可从当前播放器获取音频并在本机转录；签名媒体地址不会写入缓存
 - **关键帧截图**：自动从视频中提取画面并嵌入到总结笔记中
 - **结果缓存**：已提取的结果本地缓存，避免重复下载
 - **BibiGPT 风格输出**：结构化 Markdown 笔记，包含章节、亮点和标签
@@ -28,7 +28,7 @@
 
 1. **下载** Skill 到指定目录（参见 [安装](#安装)）
 2. **安装依赖**（参见 [依赖安装](#依赖安装)）
-3. **粘贴视频链接** 到 Cursor 或 Claude 对话中，AI 会自动识别并总结
+3. **粘贴视频链接** 并说明要完整口播稿还是总结，AI 会调用对应模式
 
 ## 安装
 
@@ -73,7 +73,7 @@ Cursor 和 Claude 会自动扫描 skills 目录下包含 `SKILL.md` 的文件夹
 |---|---|
 | B站视频 | 无需安装任何额外依赖 |
 | YouTube 视频 | `pip install youtube-transcript-api` |
-| 抖音视频 | 无需额外依赖（元数据自动获取）；Whisper 或 yt-dlp 用于转录 |
+| 抖音视频 | `yt-dlp` 和 Whisper；浏览器音频回退还需 ffmpeg |
 | 小红书视频 | 无需额外依赖（视频直接下载）；Whisper 用于转录 |
 | TikTok / 其他网站 | `pip install yt-dlp` |
 
@@ -139,7 +139,7 @@ sudo apt install ffmpeg
 |---|---|---|
 | `whisper_mode` | `"disabled"` / `"local"` / `"api"` | 语音识别模式。默认 `"disabled"` — 仅使用字幕提取。 |
 | `openai_api_key` | `"sk-..."` | OpenAI API Key。仅 `whisper_mode` 为 `"api"` 时需要。 |
-| `whisper_model` | `"tiny"` / `"base"` / `"small"` / `"medium"` / `"large"` | 本地 Whisper 模型大小。`"base"` 是速度和准确度的平衡选择。 |
+| `whisper_model` | `"tiny"` / `"base"` / `"small"` / `"medium"` / `"large"` | 本地 Whisper 模型大小。默认配置使用 `"small"`，兼顾中文识别质量与资源开销。 |
 | `language` | `"zh"` / `"en"` / `"ja"` / ... | Whisper 语言提示。使用 [ISO 639-1 编码](https://zh.wikipedia.org/wiki/ISO_639-1)。 |
 | `extract_frames` | `true` / `false` | 是否提取关键帧截图。默认 `true`。 |
 | `frames_per_video` | `1` ~ `20` | 每个视频提取几张截图。默认 `6`。 |
@@ -151,11 +151,11 @@ sudo apt install ffmpeg
 ```json
 {
     "whisper_mode": "local",
-    "whisper_model": "base",
+    "whisper_model": "small",
     "language": "zh"
 }
 ```
-首次运行会下载模型（`base` 约 150MB）。模型大小按质量排序：`tiny` < `base` < `small` < `medium` < `large`（最大约 3GB）。
+首次运行会下载模型（`small` 约数百 MB）。模型大小按质量排序：`tiny` < `base` < `small` < `medium` < `large`（最大约 3GB）。
 
 **启用 OpenAI Whisper API**（快速，需要 API Key）：
 ```json
@@ -175,7 +175,7 @@ sudo apt install ffmpeg
 
 ## TikTok 及其他平台 Cookie 设置
 
-**B站、抖音、小红书均无需 Cookie，脚本通过直接 API 解析获取视频数据。** TikTok 及部分其他平台可能仍需浏览器 Cookie。如果提取失败：
+抖音的详情接口可能对 yt-dlp 返回 403。若浏览器中的目标视频仍能播放，请按 [SKILL.md](SKILL.md) 和 [浏览器音频回退说明](references/douyin-browser-fallback.md) 操作；不要反复登录或把签名媒体地址、浏览器配置文件提交到仓库。TikTok 及部分其他平台可能需要本机 Cookie：
 
 1. 安装浏览器扩展 "[Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)"
 2. 在浏览器中打开 `douyin.com`（或 `xiaohongshu.com`）— 无需登录
@@ -209,7 +209,7 @@ sudo apt install ffmpeg
 
 | 字段 | 说明 |
 |---|---|
-| `source` | 文本获取方式：`subtitle`（字幕）、`ai_conclusion`（B站AI总结）、`transcript_api`（YouTube字幕API）、`yt_dlp_subs`（yt-dlp字幕）、`whisper_local`（本地Whisper）、`whisper_api`（OpenAI API） |
+| `source` | 文本获取方式：`subtitle`（字幕）、`ai_conclusion`（B站AI总结）、`transcript_api`（YouTube字幕API）、`yt_dlp_subs`（yt-dlp字幕）、`whisper_local`（本地Whisper）、`browser_player_whisper_local`（浏览器播放器音频 + 本地Whisper）、`whisper_api`（OpenAI API） |
 | `frames` | 关键帧截图数组，包含绝对路径和时间戳。仅在安装了 ffmpeg 且启用 `extract_frames` 时出现。 |
 | `error` | 提取失败时的错误信息。成功时不存在此字段。 |
 
@@ -257,7 +257,7 @@ python video_subtitle.py --clear-cache
 |---|---|
 | "No subtitles or transcript could be extracted" | 在 `config.json` 中启用 Whisper — 很多视频没有内置字幕 |
 | YouTube 提取失败（403 错误） | IP 可能被 YouTube 封锁，尝试使用 VPN，或在 Cursor 中使用 WebFetch 工具 |
-| 抖音提取失败 | 抖音通常无需 Cookie。如果仍然失败，手动导出 Cookie（参见 [Cookie 设置](#tiktok-及其他平台-cookie-设置)） |
+| 抖音提取失败 | 更新 yt-dlp；若详情接口仍返回 403，但视频在浏览器中可播放，按 [浏览器音频回退说明](references/douyin-browser-fallback.md) 获取完整口播稿 |
 | 小红书提取失败 | 小红书使用直接页面解析（无需 Cookie）。如视频下载失败，请检查网络连接 |
 | 找不到 `yt-dlp` | 执行 `pip install yt-dlp`；如果已安装但不在 PATH 中，脚本会自动尝试 `python -m yt_dlp` |
 | 找不到 ffmpeg / 没有截图 | 安装 ffmpeg（参见 [安装 ffmpeg](#安装-ffmpeg)）。截图功能是可选的，未安装时会自动跳过 |

@@ -1,0 +1,16 @@
+# Runtime data and credentials
+_auto_douyin_cookies.txt
+*cookies*.txt
+*.cookies.txt
+cache/
+screenshots/
+video-transcripts/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+
+# Local configuration and environment files
+.env
+.env.*
+config.local.json

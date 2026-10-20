@@ -13,12 +13,24 @@ Supported platforms:
 Fallback chain:
   1. Platform-specific subtitle API (free, no auth)
   2. yt-dlp subtitle extraction
-  3. yt-dlp audio download + Whisper ASR (local or API)
+  3. (Douyin recovery) active browser-player media + local Whisper ASR
+  4. yt-dlp audio download + Whisper ASR (local or API)
 """
 
 import ssl
-ssl._create_default_https_context = ssl._create_unverified_context
+try:
+    import certifi
 
+    def _verified_https_context(*args, **kwargs):
+        kwargs.setdefault("cafile", certifi.where())
+        return ssl.create_default_context(*args, **kwargs)
+
+    ssl._create_default_https_context = _verified_https_context
+except ImportError:
+    # Keep Python's normal certificate verification when certifi is unavailable.
+    pass
+
+import atexit
 import glob
 import gzip
 import hashlib
@@ -533,7 +545,19 @@ DOUYIN_MOBILE_UA = (
     "Cronet/TTNetVersion:b4d74d15 2023-04-08)"
 )
 
-AUTO_COOKIES_PATH = os.path.join(SCRIPT_DIR, "_auto_douyin_cookies.txt")
+_auto_cookies_path = None
+
+
+def _cleanup_auto_cookies():
+    """Remove the temporary cookie jar created for a single process run."""
+    if _auto_cookies_path and os.path.isfile(_auto_cookies_path):
+        try:
+            os.unlink(_auto_cookies_path)
+        except OSError:
+            pass
+
+
+atexit.register(_cleanup_auto_cookies)
 
 
 def _fetch_fresh_douyin_cookies():
@@ -545,6 +569,11 @@ def _fetch_fresh_douyin_cookies():
     import secrets
     import time as _time
 
+    global _auto_cookies_path
+    if _auto_cookies_path and os.path.isfile(_auto_cookies_path):
+        return _auto_cookies_path
+
+    cookie_path = None
     try:
         cj = http.cookiejar.MozillaCookieJar()
         opener = urllib.request.build_opener(
@@ -609,11 +638,20 @@ def _fetch_fresh_douyin_cookies():
             except Exception as e:
                 log(f"ttwid fetch failed (non-fatal): {e}", "WARN")
 
-        cj.save(AUTO_COOKIES_PATH, ignore_discard=True, ignore_expires=True)
+        fd, cookie_path = tempfile.mkstemp(prefix="douyin-cookies-", suffix=".txt")
+        os.close(fd)
+        os.chmod(cookie_path, 0o600)
+        cj.save(cookie_path, ignore_discard=True, ignore_expires=True)
         names = [c.name for c in cj]
         log(f"Auto-generated {len(names)} Douyin cookies: {', '.join(names)}")
-        return AUTO_COOKIES_PATH
+        _auto_cookies_path = cookie_path
+        return _auto_cookies_path
     except Exception as e:
+        if cookie_path and os.path.exists(cookie_path):
+            try:
+                os.unlink(cookie_path)
+            except OSError:
+                pass
         log(f"Auto-fetch Douyin cookies failed: {e}", "WARN")
         return None
 
@@ -637,7 +675,7 @@ def _resolve_douyin_url(url):
 
 def _douyin_share_api(video_id):
     """Fetch video metadata from iesdouyin.com share page (mobile UA, no login).
-    Returns (info_dict, play_url) or (None, None)."""
+    Returns (info_dict, play_url, subtitle_text, subtitle_coverage)."""
     share_url = f"https://www.iesdouyin.com/share/video/{video_id}/"
     try:
         req = urllib.request.Request(share_url, headers={
@@ -649,28 +687,23 @@ def _douyin_share_api(video_id):
 
         m = re.search(r"_ROUTER_DATA\s*=\s*", html)
         if not m:
-            return None, None
+            log("Douyin share page has no embedded video router data.", "WARN")
+            return None, None, None, None
         json_start = m.end()
         script_end = html.find("</script>", json_start)
         if script_end == -1:
-            return None, None
+            log("Douyin share page contains incomplete router data.", "WARN")
+            return None, None, None, None
         raw_json = html[json_start:script_end].strip()
 
         router_data = json.loads(raw_json)
-        loader = router_data.get("loaderData", {})
-        item = None
-        for v in loader.values():
-            if not isinstance(v, dict):
-                continue
-            video_res = v.get("videoInfoRes") or v
-            items = video_res.get("item_list", [])
-            if items:
-                item = items[0]
-                break
+        item = _find_douyin_item(router_data, video_id)
         if not item:
-            return None, None
+            log("Douyin share page did not expose item metadata for this video.", "WARN")
+            return None, None, None, None
 
         info = {
+            "id": str(video_id),
             "title": item.get("desc", ""),
             "author": (item.get("author") or {}).get("nickname", ""),
             "duration": (item.get("video") or {}).get("duration", 0),
@@ -690,10 +723,121 @@ def _douyin_share_api(video_id):
                     play_url = urls[0]
                     break
 
-        return info, play_url
+        subtitle_text, subtitle_coverage = _extract_douyin_caption_text(item)
+        return info, play_url, subtitle_text, subtitle_coverage
     except Exception as e:
         log(f"Douyin share API failed: {e}", "WARN")
+    return None, None, None, None
+
+
+def _find_douyin_item(data, video_id):
+    """Find an aweme item across old and new share-page payload layouts."""
+    stack = [data]
+    items = []
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            item_list = node.get("item_list")
+            if isinstance(item_list, list):
+                items.extend(item for item in item_list if isinstance(item, dict))
+            stack.extend(value for value in node.values() if isinstance(value, (dict, list)))
+        elif isinstance(node, list):
+            stack.extend(value for value in node if isinstance(value, (dict, list)))
+
+    for item in items:
+        item_id = str(item.get("aweme_id") or item.get("id") or "")
+        if item_id == str(video_id):
+            return item
+    return items[0] if items else None
+
+
+def _extract_douyin_caption_text(item):
+    """Download creator/auto captions exposed in Douyin's share-page payload."""
+    video = item.get("video") or {}
+    candidates = []
+
+    for caption in video.get("subtitle_infos") or []:
+        if isinstance(caption, dict):
+            candidates.append((caption.get("LanguageCodeName") or caption.get("LanguageCode") or "",
+                               caption.get("Url") or caption.get("url")))
+
+    cla_info = video.get("cla_info") or {}
+    for caption in cla_info.get("caption_infos") or []:
+        if isinstance(caption, dict):
+            candidates.append((caption.get("lang") or caption.get("language") or "",
+                               caption.get("url") or caption.get("Url")))
+
+    for sticker in item.get("interaction_stickers") or []:
+        if not isinstance(sticker, dict):
+            continue
+        caption_info = sticker.get("auto_video_caption_info") or {}
+        for caption in caption_info.get("auto_captions") or []:
+            if not isinstance(caption, dict):
+                continue
+            url_value = caption.get("url") or caption.get("Url")
+            if isinstance(url_value, dict):
+                url_value = (url_value.get("url_list") or [None])[0]
+            candidates.append((caption.get("language") or caption.get("lang") or "", url_value))
+
+    unique = []
+    seen = set()
+    for language, url in candidates:
+        if isinstance(url, str) and url.startswith("//"):
+            url = "https:" + url
+        if not isinstance(url, str) or not url.startswith("https://") or url in seen:
+            continue
+        seen.add(url)
+        unique.append((language.lower(), url))
+    unique.sort(key=lambda pair: 0 if any(
+        tag in pair[0] for tag in ("zh", "chinese", "中文")) else 1)
+
+    for _, caption_url in unique:
+        try:
+            payload = http_get(caption_url, raw_bytes=True)
+            text, coverage = _parse_douyin_caption_payload(payload)
+            if text:
+                log("Extracted captions from Douyin share metadata.")
+                return text, coverage
+        except Exception as e:
+            log(f"Douyin caption download failed: {e}", "WARN")
     return None, None
+
+
+def _parse_douyin_caption_payload(payload):
+    """Parse Douyin JSON utterances or a text subtitle file."""
+    decoded = payload.decode("utf-8-sig", errors="replace")
+    try:
+        data = json.loads(decoded)
+    except json.JSONDecodeError:
+        return _parse_vtt_srt(decoded), _subtitle_text_end_time(decoded)
+
+    utterances = data.get("utterances") or data.get("captions") or data.get("segments") or []
+    lines = []
+    coverage = 0.0
+    for segment in utterances:
+        if not isinstance(segment, dict):
+            continue
+        line = str(segment.get("text") or segment.get("utf8") or "").strip()
+        if not line:
+            continue
+        lines.append(line)
+        end = segment.get("end_time", segment.get("endTimeMs", segment.get("end_ms")))
+        if isinstance(end, (int, float)):
+            coverage = max(coverage, float(end) / 1000.0 if end > 1000 else float(end))
+    return ("\n".join(lines), coverage or None) if lines else (None, None)
+
+
+def _subtitle_text_end_time(content):
+    """Return the last end timestamp in an SRT/VTT subtitle document."""
+    times = re.findall(
+        r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*"
+        r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})",
+        content,
+    )
+    if not times:
+        return None
+    hours, minutes, seconds, millis = map(int, times[-1][4:])
+    return hours * 3600 + minutes * 60 + seconds + millis / 1000.0
 
 
 def _download_douyin_audio(play_url, tmp_dir):
@@ -868,11 +1012,13 @@ def extract_douyin(url):
     if not video_id:
         return None
 
-    info, play_url = _douyin_share_api(video_id)
+    info, play_url, subtitle_text, subtitle_coverage = _douyin_share_api(video_id)
     if not info:
-        info = {"title": "", "author": "", "duration": 0, "description": ""}
+        info = {"id": str(video_id), "title": "", "author": "", "duration": 0, "description": ""}
 
-    result = _make_result(info, "douyin", resolved_url)
+    result = _make_result(info, "douyin", resolved_url, subtitle_text,
+                          "douyin_share_subtitles" if subtitle_text else None,
+                          coverage_seconds=subtitle_coverage)
     result["_play_url"] = play_url
     return result
 
@@ -883,37 +1029,147 @@ def extract_douyin(url):
 
 PLATFORMS_NEEDING_COOKIES = {"douyin", "xiaohongshu", "tiktok"}
 
+# The newest official stable release available when this copy was patched.
+MIN_YTDLP_VERSION = (2026, 8, 19)
+_cached_ytdlp_cmd = None
+_cached_ytdlp_version = None
 
 def _get_ytdlp_cmd():
-    """Return the command prefix for yt-dlp. Tries the binary first, then python -m."""
-    if shutil.which("yt-dlp"):
-        return ["yt-dlp"]
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "yt_dlp", "--version"],
-            capture_output=True, timeout=10,
-        )
-        return [sys.executable, "-m", "yt_dlp"]
-    except Exception:
+    """Return the newest usable yt-dlp command available to this process."""
+    global _cached_ytdlp_cmd, _cached_ytdlp_version
+    if _cached_ytdlp_cmd is not None:
+        return list(_cached_ytdlp_cmd)
+
+    candidates = []
+    binary = shutil.which("yt-dlp")
+    if binary:
+        candidates.append([binary])
+    candidates.append([sys.executable, "-m", "yt_dlp"])
+
+    usable = []
+    seen = set()
+    for command in candidates:
+        key = tuple(command)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            result = subprocess.run(
+                command + ["--version"], capture_output=True, text=True, timeout=10,
+            )
+        except Exception:
+            continue
+        version_lines = (result.stdout or "").strip().splitlines()
+        if result.returncode != 0 or not version_lines:
+            continue
+        version_text = version_lines[0].strip()
+        numeric = tuple(int(part) for part in re.findall(r"\d+", version_text)[:4])
+        if numeric:
+            usable.append((numeric, command, version_text))
+
+    if not usable:
         return None
+
+    usable.sort(key=lambda item: item[0], reverse=True)
+    numeric, command, version_text = usable[0]
+    _cached_ytdlp_cmd = list(command)
+    _cached_ytdlp_version = version_text
+    log(f"Using yt-dlp {version_text} ({' '.join(command)}).")
+    if numeric[:3] < MIN_YTDLP_VERSION:
+        log(
+            f"yt-dlp {version_text} is older than the recommended 2026.08.19. "
+            "Update the same Python environment used to run this Skill.",
+            "WARN",
+        )
+    return list(_cached_ytdlp_cmd)
 
 
 def _check_ytdlp():
     return _get_ytdlp_cmd() is not None
 
 
-def _run_ytdlp(args, timeout=60):
-    """Run yt-dlp and return (returncode, stdout_str). Handles Windows encoding.
-    args[0] should be 'yt-dlp'; it will be replaced with the correct command."""
+def _run_ytdlp(args, timeout=60, platform="generic"):
+    """Run yt-dlp and return (returncode, stdout_str), retrying cookie sources.
+
+    Cookie candidates are applied to the requested video itself. This avoids
+    treating a successful homepage probe as proof that the video is accessible.
+    """
     cmd = _get_ytdlp_cmd()
     if cmd is None:
         return 1, "yt-dlp not found"
-    actual_args = cmd + list(args[1:])
-    result = subprocess.run(
-        actual_args, capture_output=True, timeout=timeout,
+    base_args = list(args[1:])
+    target_url = base_args[-1] if base_args else ""
+    target_key = f"{platform}:{_cache_key(target_url)}"
+    if platform == "douyin" and target_key in _ytdlp_blocked_targets:
+        log("Skipping repeated yt-dlp calls after Douyin rejected this video's web-detail request.", "WARN")
+        return 1, "Douyin rejected the video endpoint with 403/Fresh cookies"
+    candidates = _get_cookie_arg_candidates(platform)
+    runtime_args = _get_ytdlp_runtime_args(cmd)
+    last_result = None
+    saw_douyin_block = False
+
+    for index, (label, cookie_args) in enumerate(candidates):
+        if cookie_args is None:
+            auto_path = _fetch_fresh_douyin_cookies()
+            if not auto_path:
+                log("Skipping temporary guest cookies because they could not be created.", "WARN")
+                continue
+            cookie_args = ["--cookies", auto_path]
+        actual_args = cmd + runtime_args + cookie_args + base_args
+        log(f"Trying yt-dlp with {label}.")
+        try:
+            result = subprocess.run(
+                actual_args, capture_output=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            _log_ytdlp_error(e.stderr, f"yt-dlp timed out with {label}")
+            continue
+
+        stdout = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
+        stderr = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
+        last_result = (result.returncode, stdout)
+        if result.returncode == 0:
+            return last_result
+
+        if platform == "douyin" and (
+                "fresh cookies" in stderr.lower()
+                or "failed to download web detail json" in stderr.lower()):
+            saw_douyin_block = True
+        _log_ytdlp_error(stderr, f"yt-dlp failed with {label} (exit {result.returncode})")
+        if index < len(candidates) - 1:
+            log("Retrying with the next available cookie source.", "WARN")
+
+    if saw_douyin_block:
+        _ytdlp_blocked_targets.add(target_key)
+    return last_result or (1, "yt-dlp failed before returning a result")
+
+
+def _log_ytdlp_error(stderr, heading):
+    """Log useful yt-dlp diagnostics without exposing signed URLs or secrets."""
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
+    if not stderr:
+        log(heading, "WARN")
+        return
+
+    safe = re.sub(r"https?://[^\s\]\[<>\"']+", _redact_url_query, stderr)
+    safe = re.sub(
+        r"(?i)(cookie|authorization|token|signature|msToken|odin_tt|ttwid)"
+        r"(\s*[:=]\s*)[^\s,;]+",
+        r"\1\2[redacted]",
+        safe,
     )
-    stdout = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
-    return result.returncode, stdout
+    lines = [line.strip() for line in safe.splitlines() if line.strip()]
+    log(heading, "WARN")
+    for line in lines[-8:]:
+        log(line[:600], "WARN")
+
+
+def _redact_url_query(match):
+    url = match.group(0)
+    if "?" in url:
+        return url.split("?", 1)[0] + "?[query redacted]"
+    return url
 
 
 def _detect_browser():
@@ -946,70 +1202,66 @@ def _detect_browser():
 
 
 _cached_browser = None
-_cookie_args_tested = False
-_cookie_args_result = []
+_ytdlp_runtime_args = None
+_ytdlp_blocked_targets = set()
 
 
-def _get_cookie_args(platform):
-    """Return extra yt-dlp args for platforms that need browser cookies.
-    Priority: user cookies file > auto-fetched cookies > --cookies-from-browser.
-    Tests once whether the chosen method actually works."""
-    global _cached_browser, _cookie_args_tested, _cookie_args_result
+def _get_cookie_arg_candidates(platform):
+    """Return cookie sources in order, with a no-cookie attempt as final fallback."""
+    global _cached_browser
     if platform not in PLATFORMS_NEEDING_COOKIES:
-        return []
-    if _cookie_args_tested:
-        return _cookie_args_result
+        return [("no cookies", [])]
 
-    _cookie_args_tested = True
-
-    # Priority 1: user-provided cookies file in skill directory
+    candidates = []
+    seen_paths = set()
     for cp in COOKIES_PATHS:
-        if os.path.isfile(cp):
-            log(f"Using cookies file: {os.path.basename(cp)}")
-            _cookie_args_result = ["--cookies", cp]
-            return _cookie_args_result
+        if os.path.isfile(cp) and cp not in seen_paths:
+            candidates.append((f"cookie file {os.path.basename(cp)}", ["--cookies", cp]))
+            seen_paths.add(cp)
     for f in glob.glob(os.path.join(SCRIPT_DIR, "*cookies*.txt")):
-        if os.path.isfile(f) and "_auto_" not in os.path.basename(f):
-            log(f"Using cookies file: {os.path.basename(f)}")
-            _cookie_args_result = ["--cookies", f]
-            return _cookie_args_result
+        if (os.path.isfile(f) and f not in seen_paths
+                and "_auto_" not in os.path.basename(f)):
+            candidates.append((f"cookie file {os.path.basename(f)}", ["--cookies", f]))
+            seen_paths.add(f)
 
-    # Priority 2: auto-fetch fresh cookies from the platform
-    if platform == "douyin":
-        auto_path = _fetch_fresh_douyin_cookies()
-        if auto_path:
-            _cookie_args_result = ["--cookies", auto_path]
-            return _cookie_args_result
-
-    # Priority 3: --cookies-from-browser
-    _cached_browser = _detect_browser() or ""
+    # Read browser cookies for the actual target URL, after user-supplied jars.
+    _cached_browser = _cached_browser or _detect_browser() or ""
     if _cached_browser:
-        try:
-            rc, _ = _run_ytdlp(
-                ["yt-dlp", "--cookies-from-browser", _cached_browser,
-                 "--dump-json", "--no-download", "https://www.douyin.com/"],
-                timeout=15,
-            )
-            if rc == 0:
-                log(f"Using cookies from browser: {_cached_browser}")
-                _cookie_args_result = ["--cookies-from-browser", _cached_browser]
-                return _cookie_args_result
-        except Exception:
-            pass
-        log(f"Browser cookie extraction failed ({_cached_browser})", "WARN")
-    else:
-        log("No browser detected for cookie extraction", "WARN")
+        candidates.append((f"browser cookies ({_cached_browser})",
+                           ["--cookies-from-browser", _cached_browser]))
 
-    return []
+    # Create synthetic guest cookies only if real browser cookies fail.
+    if platform == "douyin":
+        candidates.append(("temporary guest cookies", None))
+
+    candidates.append(("no cookies", []))
+    return candidates
+
+
+def _get_ytdlp_runtime_args(cmd):
+    """Enable Node challenge solving when this yt-dlp build supports it."""
+    global _ytdlp_runtime_args
+    if _ytdlp_runtime_args is not None:
+        return _ytdlp_runtime_args
+    _ytdlp_runtime_args = []
+    if not shutil.which("node"):
+        return _ytdlp_runtime_args
+    try:
+        result = subprocess.run(cmd + ["--help"], capture_output=True, timeout=15)
+        help_text = (result.stdout or b"").decode("utf-8", errors="replace")
+        if "--js-runtimes" in help_text:
+            _ytdlp_runtime_args = ["--js-runtimes", "node"]
+    except Exception:
+        pass
+    return _ytdlp_runtime_args
 
 
 def _ytdlp_extract_info(url, platform="generic"):
     """Use yt-dlp --dump-json to get video metadata without downloading."""
     try:
         cmd = ["yt-dlp", "--dump-json", "--no-download", "--no-playlist"]
-        cmd += _get_cookie_args(platform)
         cmd.append(url)
-        rc, stdout = _run_ytdlp(cmd)
+        rc, stdout = _run_ytdlp(cmd, platform=platform)
         if rc == 0 and stdout.strip():
             return json.loads(stdout)
     except Exception as e:
@@ -1030,9 +1282,8 @@ def _ytdlp_extract_subs(url, tmp_dir, platform="generic"):
             "--no-playlist",
             "-o", os.path.join(tmp_dir, "%(id)s.%(ext)s"),
         ]
-        cmd += _get_cookie_args(platform)
         cmd.append(url)
-        _run_ytdlp(cmd)
+        _run_ytdlp(cmd, platform=platform)
     except Exception as e:
         log(f"yt-dlp subtitle download failed: {e}", "WARN")
         return None
@@ -1044,13 +1295,30 @@ def _ytdlp_extract_subs(url, tmp_dir, platform="generic"):
         + glob.glob(os.path.join(tmp_dir, "*.srv3"))
     )
     if not sub_files:
-        return None
+        return None, None
 
     for sf in sub_files:
         text = _parse_subtitle_file(sf)
         if text:
-            return text
-    return None
+            return text, _subtitle_file_coverage(sf)
+    return None, None
+
+
+def _subtitle_file_coverage(filepath):
+    """Read the final subtitle timestamp when the downloaded format has timing."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+        if filepath.lower().endswith(".json3"):
+            events = (json.loads(content).get("events") or [])
+            ends = [
+                (event.get("tStartMs", 0) + event.get("dDurationMs", 0)) / 1000.0
+                for event in events if isinstance(event, dict)
+            ]
+            return max(ends) if ends else None
+        return _subtitle_text_end_time(content)
+    except Exception:
+        return None
 
 
 def _parse_subtitle_file(filepath):
@@ -1132,9 +1400,8 @@ def _ytdlp_download_audio(url, tmp_dir, platform="generic"):
             "--no-playlist",
             "-o", audio_path,
         ]
-        cmd += _get_cookie_args(platform)
         cmd.append(url)
-        rc, _ = _run_ytdlp(cmd, timeout=300)
+        rc, _ = _run_ytdlp(cmd, timeout=300, platform=platform)
         if rc == 0 and os.path.exists(audio_path):
             return audio_path
     except Exception as e:
@@ -1155,9 +1422,8 @@ def _ytdlp_download_video(url, tmp_dir, platform="generic"):
             "--no-playlist",
             "-o", video_path,
         ]
-        cmd += _get_cookie_args(platform)
         cmd.append(url)
-        rc, out = _run_ytdlp(cmd, timeout=300)
+        rc, out = _run_ytdlp(cmd, timeout=300, platform=platform)
         if rc == 0 and os.path.exists(video_path):
             return video_path
         log(f"yt-dlp video download returned rc={rc}", "WARN")
@@ -1350,9 +1616,10 @@ def extract_with_ytdlp(url, platform="generic"):
     tmp_dir = tempfile.mkdtemp(prefix="video_sub_")
     try:
         log(f"Trying yt-dlp subtitle extraction for {platform}...")
-        text = _ytdlp_extract_subs(url, tmp_dir, platform)
+        text, coverage = _ytdlp_extract_subs(url, tmp_dir, platform)
         if text:
-            return _make_result(info, platform, url, text, "yt_dlp_subs")
+            return _make_result(info, platform, url, text, "yt_dlp_subs",
+                                coverage_seconds=coverage)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1363,7 +1630,77 @@ def extract_with_ytdlp(url, platform="generic"):
 # Whisper ASR fallback
 # ---------------------------------------------------------------------------
 
-def transcribe_with_whisper(url, platform, info, config, play_url=None):
+def _download_browser_media_audio(media_url, tmp_dir):
+    """Download media exposed by the active browser player, then extract audio.
+
+    The signed media URL is accepted only in memory and is never logged or
+    cached. This path is for cases where the video page plays successfully but
+    the platform's metadata API rejects yt-dlp.
+    """
+    from urllib.parse import urlparse
+
+    if not isinstance(media_url, str):
+        return None, None
+    parsed = urlparse(media_url)
+    host = (parsed.hostname or "").lower()
+    allowed_hosts = ("douyinvod.com", "bytevod.com", "bytecdn.cn", "douyin.com")
+    if parsed.scheme != "https" or not any(
+        host == domain or host.endswith("." + domain) for domain in allowed_hosts
+    ):
+        log("Browser player media URL is not from an allowed Douyin media host.", "WARN")
+        return None, None
+
+    source_path = os.path.join(tmp_dir, "browser_media.bin")
+    audio_path = os.path.join(tmp_dir, "browser_media.wav")
+    request = urllib.request.Request(media_url, headers={
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/140.0.0.0 Safari/537.36",
+        "Referer": "https://www.douyin.com/",
+        "Origin": "https://www.douyin.com",
+        "Accept": "*/*",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            if response.status not in (200, 206):
+                log(f"Browser media request returned HTTP {response.status}.", "WARN")
+                return None, None
+            with open(source_path, "wb") as output:
+                while True:
+                    block = response.read(1024 * 1024)
+                    if not block:
+                        break
+                    output.write(block)
+    except urllib.error.HTTPError as e:
+        log(f"Browser media request returned HTTP {e.code}.", "WARN")
+        return None, None
+    except Exception as e:
+        # URL errors can contain signed query parameters; keep diagnostics safe.
+        log(f"Browser media download failed ({type(e).__name__}).", "WARN")
+        return None, None
+
+    duration = _get_video_duration_ffprobe(source_path)
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        log("ffmpeg not installed; cannot extract audio from browser media.", "ERROR")
+        return None, duration
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", source_path,
+             "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", audio_path],
+            capture_output=True, text=True, timeout=180,
+        )
+    except Exception as e:
+        log(f"ffmpeg audio extraction failed ({type(e).__name__}).", "ERROR")
+        return None, duration
+    if result.returncode != 0 or not os.path.exists(audio_path):
+        log("ffmpeg could not extract audio from browser media.", "ERROR")
+        return None, duration
+    return audio_path, duration
+
+
+def transcribe_with_whisper(url, platform, info, config, play_url=None,
+                            browser_media_url=None):
     """Download audio then transcribe with Whisper.
     For Douyin, uses play_url for direct download if yt-dlp fails."""
     whisper_mode = config.get("whisper_mode", "disabled")
@@ -1374,8 +1711,15 @@ def transcribe_with_whisper(url, platform, info, config, play_url=None):
     try:
         log("Downloading audio for Whisper transcription...")
         audio_path = None
+        browser_duration = None
 
-        if _check_ytdlp():
+        if browser_media_url:
+            log("Using media exposed by the active browser player; signed URL is kept in memory.")
+            audio_path, browser_duration = _download_browser_media_audio(
+                browser_media_url, tmp_dir,
+            )
+
+        if not audio_path and _check_ytdlp() and not browser_media_url:
             audio_path = _ytdlp_download_audio(url, tmp_dir, platform)
 
         if not audio_path and play_url:
@@ -1401,12 +1745,91 @@ def transcribe_with_whisper(url, platform, info, config, play_url=None):
             return None
 
         if text:
-            source = f"whisper_{whisper_mode}"
-            return _make_result(info, platform, url, text, source)
+            source = ("browser_player_whisper_" + whisper_mode
+                      if browser_media_url and audio_path else f"whisper_{whisper_mode}")
+            if not info.get("duration") and browser_duration:
+                info["duration"] = browser_duration
+            # ASR covered the complete downloaded audio file, even when the
+            # source page itself exposed no timed caption track.
+            return _make_result(info, platform, url, text, source,
+                                coverage_seconds=info.get("duration") or browser_duration or None)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return None
+
+
+def _wait_for_browser_media_url(timeout=180):
+    """Accept one signed media URL from this computer's active browser only.
+
+    The URL is sent over loopback and held in memory; it is not written to
+    disk, logged, or included in transcript cache entries.
+    """
+    import secrets
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from urllib.parse import urlparse
+
+    token = secrets.token_urlsafe(24)
+    allowed_hosts = ("douyinvod.com", "bytevod.com", "bytecdn.cn", "douyin.com")
+
+    class Receiver(BaseHTTPRequestHandler):
+        def _cors(self):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self._cors()
+            self.end_headers()
+
+        def do_POST(self):
+            if self.path != "/" + token:
+                self.send_response(404)
+                self._cors()
+                self.end_headers()
+                return
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                size = 0
+            if size <= 0 or size > 16384:
+                self.send_response(400)
+                self._cors()
+                self.end_headers()
+                return
+            candidate = self.rfile.read(size).decode("utf-8", errors="replace").strip()
+            parsed = urlparse(candidate)
+            host = (parsed.hostname or "").lower()
+            if parsed.scheme != "https" or not any(
+                host == domain or host.endswith("." + domain) for domain in allowed_hosts
+            ):
+                self.send_response(400)
+                self._cors()
+                self.end_headers()
+                return
+            self.server.media_url = candidate
+            self.send_response(200)
+            self._cors()
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, fmt, *args):
+            # The request body is a short-lived signed URL; suppress all logs.
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), Receiver)
+    server.timeout = 1
+    endpoint = f"http://127.0.0.1:{server.server_port}/{token}"
+    print(f"Waiting up to {timeout}s for the active Douyin player. POST its media URL to {endpoint}",
+          file=sys.stderr, flush=True)
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline and not getattr(server, "media_url", None):
+            server.handle_request()
+    finally:
+        server.server_close()
+    return getattr(server, "media_url", None)
 
 
 def _whisper_api(audio_path, config):
@@ -1487,13 +1910,19 @@ def _whisper_local(audio_path, config):
         log("faster-whisper not installed. Run: pip install faster-whisper", "ERROR")
         return None
 
-    model_size = config.get("whisper_model", "base")
+    model_size = config.get("whisper_model", "small")
     language = config.get("language", "zh")
     log(f"Loading Whisper model '{model_size}'...")
 
     try:
         model = WhisperModel(model_size, device="auto", compute_type="auto")
-        segments, _ = model.transcribe(audio_path, language=language)
+        segments, _ = model.transcribe(
+            audio_path,
+            language=language,
+            beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=True,
+        )
         lines = [seg.text.strip() for seg in segments if seg.text.strip()]
         return "\n".join(lines) if lines else None
     except Exception as e:
@@ -1514,7 +1943,8 @@ def format_duration(seconds):
     return f"{seconds // 3600}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
 
 
-def _make_result(info, platform, url, subtitle_text=None, source=None, error=None):
+def _make_result(info, platform, url, subtitle_text=None, source=None, error=None,
+                 coverage_seconds=None):
     return {
         "info": info,
         "platform": platform,
@@ -1522,6 +1952,7 @@ def _make_result(info, platform, url, subtitle_text=None, source=None, error=Non
         "subtitle_text": subtitle_text,
         "source": source,
         "error": error,
+        "coverage_seconds": coverage_seconds,
     }
 
 
@@ -1529,15 +1960,19 @@ def _make_result(info, platform, url, subtitle_text=None, source=None, error=Non
 # Main orchestration
 # ---------------------------------------------------------------------------
 
-def extract(url, config):
+def extract(url, config, browser_media_url=None):
     """
     Main entry point. Tries cache, then platform-specific extraction,
     then yt-dlp subs, then Whisper ASR. Returns a result dict.
     """
-    # Phase 0: check cache
-    cached = _read_cache(url)
-    if cached:
-        return cached
+    # An explicit browser media handoff requests a fresh recovery attempt;
+    # a cached partial transcript must not block processing the full audio.
+    if browser_media_url:
+        log("Bypassing transcript cache for the explicit browser media fallback.")
+    else:
+        cached = _read_cache(url)
+        if cached:
+            return cached
 
     platform = detect_platform(url)
     log(f"Detected platform: {platform}")
@@ -1546,7 +1981,16 @@ def extract(url, config):
     result = None
     play_url = None
 
-    if platform == "bilibili":
+    if platform == "douyin" and browser_media_url:
+        video_id = re.search(r"(?:video/|modal_id=)(\d+)", url)
+        result = _make_result({
+            "id": video_id.group(1) if video_id else "",
+            "title": "",
+            "author": "",
+            "duration": 0,
+            "description": "",
+        }, platform, url)
+    elif platform == "bilibili":
         result = extract_bilibili(url)
     elif platform == "youtube":
         result = extract_youtube(url)
@@ -1557,6 +2001,9 @@ def extract(url, config):
 
     if result:
         play_url = result.get("_play_url")
+    # Use the resolved canonical video URL for subsequent yt-dlp/Whisper
+    # requests. Short-link hosts can reject guest-cookie retries or fail TLS.
+    target_url = (result.get("url") if result and result.get("url") else url)
 
     final_result = None
 
@@ -1566,23 +2013,29 @@ def extract(url, config):
         # Phase 2: yt-dlp subtitle extraction (works for all platforms)
         info = result["info"] if result else {"title": "", "author": "", "duration": 0, "description": ""}
 
-        if _check_ytdlp():
-            ytdlp_result = extract_with_ytdlp(url, platform)
+        if _check_ytdlp() and not browser_media_url:
+            ytdlp_result = extract_with_ytdlp(target_url, platform)
             if ytdlp_result:
                 if ytdlp_result.get("subtitle_text"):
                     if not info.get("title") and ytdlp_result["info"].get("title"):
                         info = ytdlp_result["info"]
                     final_result = _make_result(info, platform, url,
                                                 ytdlp_result["subtitle_text"],
-                                                ytdlp_result["source"])
+                                                ytdlp_result["source"],
+                                                coverage_seconds=ytdlp_result.get("coverage_seconds"))
                 if not info.get("title") and ytdlp_result["info"].get("title"):
                     info = ytdlp_result["info"]
-        else:
+        elif not browser_media_url:
             log("yt-dlp not installed. Install with: pip install yt-dlp", "WARN")
+        else:
+            log("Skipping repeated yt-dlp metadata calls; using the verified browser-player media.")
 
         # Phase 3: Whisper ASR fallback
         if not final_result:
-            whisper_result = transcribe_with_whisper(url, platform, info, config, play_url=play_url)
+            whisper_result = transcribe_with_whisper(
+                target_url, platform, info, config, play_url=play_url,
+                browser_media_url=browser_media_url,
+            )
             if whisper_result and whisper_result.get("subtitle_text"):
                 final_result = whisper_result
 
@@ -1596,13 +2049,27 @@ def extract(url, config):
                     import youtube_transcript_api  # noqa: F401
                 except ImportError:
                     error_parts.append("Install youtube-transcript-api for YouTube: pip install youtube-transcript-api")
-            if platform in PLATFORMS_NEEDING_COOKIES and not _cookie_args_result:
-                error_parts.append(
-                    f"Douyin/Xiaohongshu/TikTok require browser cookies. "
-                    f"Export cookies: install 'Get cookies.txt LOCALLY' browser extension, "
-                    f"visit the site, export, and save the file (e.g. www.douyin.com_cookies.txt "
-                    f"or cookies.txt) in: {SCRIPT_DIR}"
-                )
+            if platform in PLATFORMS_NEEDING_COOKIES:
+                if platform == "douyin":
+                    if browser_media_url:
+                        error_parts.append(
+                            "The browser-player media fallback was received but could not be "
+                            "downloaded or transcribed. Check the sanitized ffmpeg/Whisper "
+                            "diagnostic above; do not retry authentication or print the signed URL."
+                        )
+                    else:
+                        error_parts.append(
+                            "Douyin returned 403/Fresh cookies for the video's web-detail endpoint "
+                            "after browser, guest, and anonymous attempts. This can persist with a "
+                            "valid login when Douyin changes its API. Update yt-dlp if it is outdated; "
+                            "if the error remains, stop retrying logins and use the browser-player "
+                            "fallback or another available transcript source."
+                        )
+                else:
+                    error_parts.append(
+                        "The platform rejected all available access methods. Check whether the "
+                        "supported local browser has an active session."
+                    )
             whisper_mode = config.get("whisper_mode", "disabled")
             if whisper_mode == "disabled":
                 error_parts.append("Enable Whisper in config.json for audio transcription fallback.")
@@ -1610,10 +2077,14 @@ def extract(url, config):
 
     # Phase 4: Extract keyframes (runs for all successful extractions)
     duration = (final_result.get("info") or {}).get("duration", 0)
-    frames = extract_keyframes(url, platform, config, play_url=play_url, duration=duration)
+    frames = ([] if browser_media_url else
+              extract_keyframes(target_url, platform, config, play_url=play_url, duration=duration))
     if frames:
         final_result["frames"] = frames
 
+    # A direct media URL can carry a short-lived signature. Keep it only in
+    # memory for downloading; never put it in the persistent transcript cache.
+    final_result.pop("_play_url", None)
     _write_cache(url, final_result)
     return final_result
 
@@ -1634,6 +2105,16 @@ def main():
     parser = argparse.ArgumentParser(description='Extract video subtitles and create summaries or scripts.')
     parser.add_argument('url', type=str, nargs='?', default=None, help='The URL of the video.')
     parser.add_argument('--mode', type=str, default='summary', choices=['summary', 'script'], help='The output mode: summary or script.')
+    parser.add_argument('--output-dir', type=str, default=None,
+                        help='Directory for script Markdown output (defaults to the current directory).')
+    parser.add_argument('--browser-media-url-file', type=str, default=None,
+                        help='Read a temporary active-player media URL from a local file; never log or cache it.')
+    parser.add_argument('--wait-for-browser-media-url', action='store_true',
+                        help='Wait for the verified active browser player to send its media URL over loopback.')
+    parser.add_argument('--title', type=str, default=None,
+                        help='Optional video title when the platform detail API is unavailable.')
+    parser.add_argument('--author', type=str, default=None,
+                        help='Optional video author when the platform detail API is unavailable.')
     parser.add_argument('--clear-cache', action='store_true', help='Clear all cached results and screenshots.')
     args = parser.parse_args()
 
@@ -1647,30 +2128,78 @@ def main():
 
     config = load_config()
 
+    browser_media_url = None
+    if args.wait_for_browser_media_url:
+        browser_media_url = _wait_for_browser_media_url()
+        if not browser_media_url:
+            log("No browser-player media URL arrived before timeout.", "ERROR")
+            sys.exit(1)
+    if args.browser_media_url_file:
+        try:
+            with open(args.browser_media_url_file, "r", encoding="utf-8") as f:
+                browser_media_url = f.read().strip()
+            if not browser_media_url:
+                log("Browser media URL file is empty.", "ERROR")
+                sys.exit(1)
+        except OSError as e:
+            log(f"Cannot read browser media URL file: {e}", "ERROR")
+            sys.exit(1)
+
     log(f"Extracting subtitles for: {args.url}")
-    result = extract(args.url, config)
+    result = extract(args.url, config, browser_media_url=browser_media_url)
 
     if not result:
         log("Extraction returned no result", "ERROR")
         sys.exit(1)
 
     info = result.get("info", {})
+    if args.title and not info.get("title"):
+        info["title"] = args.title
+    if args.author and not info.get("author"):
+        info["author"] = args.author
 
     if args.mode == 'script':
         if result.get("subtitle_text"):
             video_title = info.get("title", "video_script")
             safe_title = "".join(c for c in video_title if c.isalnum() or c in (' ', '_', '-')).rstrip()
-            filename = f"{safe_title}.md"
-            with open(filename, "w", encoding="utf-8") as f:
+            safe_title = safe_title or "video_script"
+            video_id = str(info.get("id") or "")
+            if not video_id:
+                id_match = re.search(r"(?:video/|modal_id=)(\d+)", args.url)
+                video_id = id_match.group(1) if id_match else ""
+            filename = f"{safe_title}_{video_id}.md" if video_id else f"{safe_title}.md"
+            output_dir = os.path.abspath(args.output_dir or os.getcwd())
+            os.makedirs(output_dir, exist_ok=True)
+            output_path = os.path.join(output_dir, filename)
+            # Protect transcripts for different videos with identical titles,
+            # and avoid replacing a previous run for the same URL.
+            if os.path.exists(output_path):
+                stem, ext = os.path.splitext(filename)
+                index = 2
+                while os.path.exists(os.path.join(output_dir, f"{stem}_{index}{ext}")):
+                    index += 1
+                output_path = os.path.join(output_dir, f"{stem}_{index}{ext}")
+            with open(output_path, "w", encoding="utf-8") as f:
                 f.write(f"# {info.get('title', '')}\n\n")
                 f.write(f"**Author:** {info.get('author', '')}\n")
                 f.write(f"**Duration:** {format_duration(info.get('duration', 0))}\n")
                 f.write(f"**URL:** {result.get('url', args.url)}\n\n")
+                f.write(f"**Source:** {result.get('source') or 'unknown'}\n")
+                coverage = result.get("coverage_seconds")
+                coverage_label = ("Audio duration transcribed" if "whisper" in (result.get("source") or "")
+                                  else "Subtitle time coverage")
+                if coverage is None:
+                    f.write(f"**{coverage_label}:** unknown; compare against the full video before calling this complete.\n\n")
+                else:
+                    f.write(f"**{coverage_label}:** {format_duration(coverage)} / {format_duration(info.get('duration', 0))}\n\n")
                 f.write("---\n\n")
                 f.write(result["subtitle_text"])
-            print(f"Script saved to {filename}")
+            print(f"Script saved to {output_path}")
         else:
-            print("Failed to extract script.")
+            print("Failed to extract script.", file=sys.stderr)
+            if result.get("error"):
+                print(result["error"], file=sys.stderr)
+            sys.exit(1)
     else:  # summary mode
         output = {
             "title": info.get("title", ""),
@@ -1688,6 +2217,7 @@ def main():
 
         output["source"] = result.get("source", "unknown")
         output["subtitle_text"] = result.get("subtitle_text")
+        output["coverage_seconds"] = result.get("coverage_seconds")
 
         if result.get("frames"):
             output["frames"] = [

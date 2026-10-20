@@ -20,6 +20,7 @@ This tool combines two main functionalities, selectable via a `--mode` flag:
 - **Dual-Mode Operation**: Get a quick summary or a full script with a simple command-line flag.
 - **Multi-Platform Support**: Works seamlessly across coscienza video sites.
 - **Automatic Fallbacks**: Uses platform APIs, then `yt-dlp`, and finally Whisper ASR for transcription, ensuring the best possible result.
+- **Douyin browser-player fallback**: When Douyin blocks its detail endpoint but the exact video still plays in the browser, hand off the active player's media URL over a one-use loopback endpoint and transcribe locally. The signed URL is not logged or cached. See [SKILL.md](SKILL.md) and [the fallback guide](references/douyin-browser-fallback.md).
 - **Robust Error Handling**: Includes a fix for common SSL certificate verification issues.
 - **Local Caching**: Caches results to speed up repeated requests for the same video.
 

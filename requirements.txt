@@ -13,7 +13,8 @@
 #   pip install Pillow                                   # Image resizing for keyframe screenshots
 
 youtube-transcript-api
-yt-dlp
+yt-dlp[default]>=2026.08.19
+certifi
 faster-whisper
 openai
 pydub
